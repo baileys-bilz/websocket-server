@@ -8,11 +8,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger Railway deploy
+      - name: Deploy to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: |
           curl -s -H "Authorization: Bearer $RAILWAY_TOKEN" \
             https://backboard.railway.app/graphql/v2 \
             -X POST -H "Content-Type: application/json" \
-            -d '{"query":"mutation { serviceInstanceDeploy(serviceId: \"8f54602d-87d7-409e-9374-ca2ee9ba3e0b\", environmentId: \"1ff6499d-e400-41c0-994b-d4b312bf6a45\") }"}'
+            -d '{"query":"mutation { githubRepoDeploy(input: { projectId: \"a652683a-96db-40a8-97d8-83b3c4526153\", environmentId: \"1ff6499d-e400-41c0-994b-d4b312bf6a45\", repo: \"baileys-bilz/websocket-server\", branch: \"master\" }) }"}'
