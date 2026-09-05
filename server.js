@@ -1,101 +1,32 @@
 const { WebSocketServer } = require('ws');
 const http = require('http');
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const path = require('path');
-
-const logger = pino({ level: 'silent' });
+const crypto = require('crypto');
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
+  // Health check
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'ok',
-      uptime: process.uptime(),
-      whatsapp: waConnected ? 'connected' : 'disconnected',
-    }));
-    return;
+    return res.end(JSON.stringify({ status: 'ok', clients: clientCount, uptime: process.uptime() }));
   }
 
-  if (req.url === '/') {
+  // Rich HTML page for WhatsApp preview / browser test
+  if (req.url === '/' || req.url === '/rich') {
     res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(`<!DOCTYPE html>
-<html><head><title>WS + WhatsApp Bot</title>
-<style>
-  body { font-family: system-ui; max-width: 600px; margin: 40px auto; padding: 20px; background: #0a0a0a; color: #e0e0e0; }
-  h1 { color: #25D366; }
-  .status { padding: 12px; border-radius: 8px; margin: 16px 0; }
-  .ok { background: #1a3a1a; border: 1px solid #25D366; }
-  .off { background: #3a1a1a; border: 1px solid #ff4444; }
-  code { background: #1a1a2e; padding: 2px 8px; border-radius: 4px; font-size: 14px; }
-  .endpoint { background: #1a1a2e; padding: 16px; border-radius: 8px; margin: 12px 0; }
-  .endpoint p { margin: 4px 0; }
-</style></head><body>
-  <h1>🟢 WebSocket + WhatsApp Bot Server</h1>
-  <div class="status ${waConnected ? 'ok' : 'off'}">
-    WhatsApp: <strong>${waConnected ? 'Connected ✅' : 'Disconnected ❌'}</strong>
-  </div>
-  <div class="endpoint">
-    <p><strong>WebSocket:</strong> <code>wss://${req.headers.host}</code></p>
-    <p><strong>Health:</strong> <code>https://${req.headers.host}/health</code></p>
-    <p><strong>WA Pairing:</strong> <code>POST /pair?phone=62xxx</code></p>
-    <p><strong>WA Status:</strong> <code>GET /wa-status</code></p>
-  </div>
-</body></html>`);
-    return;
+    return res.end(getRichHTML(req.headers.host));
   }
 
-  // WhatsApp pairing endpoint
-  if (req.url.startsWith('/pair') && req.method === 'POST') {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const phone = url.searchParams.get('phone');
-    if (!phone) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Missing ?phone= parameter' }));
-      return;
-    }
-    handlePairing(phone, res);
-    return;
-  }
-
-  // WhatsApp status
-  if (req.url === '/wa-status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      connected: waConnected,
-      phone: waPhoneNumber,
-      uptime: waConnected ? Math.floor(process.uptime()) : 0,
-    }));
-    return;
-  }
-
-  // Send WhatsApp message
-  if (req.url.startsWith('/send') && req.method === 'POST') {
+  // API: Send rich response data to all WS clients
+  if (req.url === '/api/broadcast' && req.method === 'POST') {
     let body = '';
-    req.on('data', (chunk) => body += chunk);
+    req.on('data', c => body += c);
     req.on('end', () => {
       try {
-        const { to, message } = JSON.parse(body);
-        if (!to || !message) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Missing to/message' }));
-          return;
-        }
-        sendWhatsAppMessage(to, message).then((result) => {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, result }));
-        }).catch((err) => {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: err.message }));
-        });
-      } catch (err) {
+        const data = JSON.parse(body);
+        broadcastToWS({ type: 'rich:data', ...data });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, clients: clientCount }));
+      } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
       }
@@ -103,8 +34,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not found' }));
+  // API: Get Baileys plugin source
+  if (req.url === '/plugin.js') {
+    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+    return res.end(getPluginCode(req.headers.host));
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
 });
 
 // ─── WebSocket Server ────────────────────────────────────────────────────────
@@ -113,298 +50,272 @@ let clientCount = 0;
 
 wss.on('connection', (ws, req) => {
   clientCount++;
-  const clientId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`[WS:CONNECT] ${clientId} from ${clientIp} | Total: ${clientCount}`);
+  const id = `c-${Date.now().toString(36)}`;
+  console.log(`[WS:+] ${id} | Total: ${clientCount}`);
 
   ws.send(JSON.stringify({
-    type: 'welcome',
-    clientId,
-    whatsapp: { connected: waConnected, phone: waPhoneNumber },
-    timestamp: new Date().toISOString(),
+    event: 'connection',
+    id,
+    clients: clientCount,
+    time: Date.now()
   }));
 
-  ws.on('message', (data) => {
+  ws.on('message', raw => {
     try {
-      const msg = JSON.parse(data.toString());
-      console.log(`[WS:MESSAGE] ${clientId}:`, msg);
+      const msg = JSON.parse(raw.toString());
+      console.log(`[WS:MSG] ${id}:`, msg.event || msg.type || 'data');
 
-      // If message has 'to' and 'text', send via WhatsApp
-      if (msg.to && msg.text) {
-        sendWhatsAppMessage(msg.to, msg.text).then(() => {
-          ws.send(JSON.stringify({ type: 'wa:sent', to: msg.to, status: 'delivered' }));
-        }).catch((err) => {
-          ws.send(JSON.stringify({ type: 'wa:error', error: err.message }));
-        });
-        return;
-      }
-
-      // Echo back
-      ws.send(JSON.stringify({
-        type: 'echo',
-        clientId,
-        data: msg,
-        serverTime: new Date().toISOString(),
-      }));
-
-      // Broadcast to others
-      wss.clients.forEach((client) => {
-        if (client !== ws && client.readyState === 1) {
-          client.send(JSON.stringify({
-            type: 'broadcast',
-            from: clientId,
+      // Echo + broadcast
+      wss.clients.forEach(c => {
+        if (c.readyState === 1) {
+          c.send(JSON.stringify({
+            event: msg.event || 'message',
+            from: id,
             data: msg,
-            timestamp: new Date().toISOString(),
+            time: Date.now()
           }));
         }
       });
-    } catch (err) {
-      ws.send(JSON.stringify({ type: 'echo', data: data.toString() }));
+    } catch {
+      ws.send(JSON.stringify({ event: 'echo', data: raw.toString() }));
     }
   });
 
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-  ws.on('close', () => { clientCount--; console.log(`[WS:DISCONNECT] ${clientId} | Total: ${clientCount}`); });
-  ws.on('error', (err) => console.error(`[WS:ERROR] ${clientId}:`, err.message));
+  ws.on('close', () => { clientCount--; console.log(`[WS:-] ${id} | Total: ${clientCount}`); });
 });
 
 // Keepalive
 setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
   });
 }, 30000);
 
-// ─── Broadcast to WS clients ─────────────────────────────────────────────────
 function broadcastToWS(data) {
-  const payload = JSON.stringify(data);
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1) client.send(payload);
-  });
+  const json = JSON.stringify(data);
+  wss.clients.forEach(c => { if (c.readyState === 1) c.send(json); });
 }
 
-// ─── WhatsApp Bot ────────────────────────────────────────────────────────────
-let waSocket = null;
-let waConnected = false;
-let waPhoneNumber = null;
-let pairingInProgress = false;
-const AUTH_DIR = path.join(__dirname, 'auth_info');
-
-async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
-
-  waSocket = makeWASocket({
-    version,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    logger,
-    printQRInTerminal: false,
-    browser: ['WebSocket-Bot', 'Chrome', '1.0.0'],
-    generateHighQualityLinkPreview: false,
-  });
-
-  // Connection updates
-  waSocket.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (connection === 'open') {
-      waConnected = true;
-      waPhoneNumber = waSocket.user?.id?.split(':')[0] || null;
-      console.log(`[WA:CONNECTED] Phone: ${waPhoneNumber}`);
-      broadcastToWS({ type: 'wa:status', connected: true, phone: waPhoneNumber });
-    }
-
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      waConnected = false;
-      waPhoneNumber = null;
-      console.log(`[WA:DISCONNECTED] Status: ${statusCode}`);
-      broadcastToWS({ type: 'wa:status', connected: false });
-
-      if (statusCode !== DisconnectReason.loggedOut) {
-        console.log('[WA:RECONNECTING] in 5s...');
-        setTimeout(() => startWhatsApp(), 5000);
-      } else {
-        console.log('[WA:LOGGED_OUT] Need to re-pair');
-      }
-    }
-  });
-
-  // Save credentials on update
-  waSocket.ev.on('creds.update', saveCreds);
-
-  // Message handler
-  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-
-    for (const msg of messages) {
-      if (msg.key.fromMe) continue;
-
-      const from = msg.key.remoteJid;
-      const text = msg.message?.conversation
-        || msg.message?.extendedTextMessage?.text
-        || msg.message?.imageMessage?.caption
-        || '';
-      const sender = msg.pushName || from.split('@')[0];
-
-      console.log(`[WA:MSG] ${sender} (${from}): ${text}`);
-
-      // Broadcast to WebSocket clients
-      broadcastToWS({
-        type: 'wa:message',
-        from,
-        sender,
-        text,
-        timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
-        id: msg.key.id,
-      });
-
-      // ── Bot Commands ────────────────────────────────────────────────
-      const cmd = text.toLowerCase().trim();
-
-      if (cmd === '!ping') {
-        await waSocket.sendMessage(from, { text: '🏓 Pong!' });
-      } else if (cmd === '!info') {
-        await waSocket.sendMessage(from, {
-          text: `🤖 *WebSocket Bot*\n\n` +
-                `📱 Number: ${waPhoneNumber || 'N/A'}\n` +
-                `👥 WS Clients: ${clientCount}\n` +
-                `⏱️ Uptime: ${Math.floor(process.uptime())}s\n` +
-                `📡 Status: Online`
-        });
-      } else if (cmd === '!help') {
-        await waSocket.sendMessage(from, {
-          text: `📋 *Commands*\n\n` +
-                `!ping - Test bot\n` +
-                `!info - Bot info\n` +
-                `!help - Show this\n` +
-                `!echo <text> - Repeat text\n` +
-                `!broadcast <text> - Send to all WS clients`
-        });
-      } else if (cmd.startsWith('!echo ')) {
-        const echo = text.slice(6);
-        await waSocket.sendMessage(from, { text: echo });
-      } else if (cmd.startsWith('!broadcast ')) {
-        const broadcast = text.slice(11);
-        broadcastToWS({ type: 'wa:broadcast', from, sender, text: broadcast });
-        await waSocket.sendMessage(from, { text: `✅ Broadcasted to ${clientCount} clients` });
-      }
-    }
-  });
+// ─── Rich HTML Template ──────────────────────────────────────────────────────
+function getRichHTML(host) {
+  const wsUrl = `wss://${host}/`;
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebSocket Rich</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+html,body{margin:0;padding:0;width:100%;background:transparent;font-family:"SFMono-Regular","Cascadia Code","Roboto Mono",Consolas,monospace}
+body{padding:10px}
+.terminal{width:100%;max-width:680px;margin:auto;overflow:hidden;border-radius:12px;background:#080b0e;border:1px solid #20262c;box-shadow:0 12px 30px rgba(0,0,0,.45),inset 0 1px rgba(255,255,255,.025)}
+.header{height:36px;display:flex;align-items:center;padding:0 12px;background:#101419;border-bottom:1px solid #20262c}
+.dots{display:flex;gap:5px}
+.dot{width:8px;height:8px;border-radius:50%;background:#343c43}
+.terminal-title{flex:1;text-align:center;margin-right:34px;color:#707a83;font-size:9px}
+.content{padding:14px}
+.command-line{font-size:9px;line-height:1.7;word-break:break-word}
+.user{color:#5cff8d}
+.host{color:#72b7ff}
+.symbol{color:#626c74}
+.command{color:#dce3e8;margin-left:4px}
+.title{margin-top:8px;color:#edf1f3;font-size:15px;font-weight:700}
+.subtitle{margin-top:4px;color:#555f67;font-size:7px;letter-spacing:1px}
+.status{margin-top:13px;padding:11px;border-radius:8px;background:#0b0f12;border:1px solid #1c242a}
+.status-row{display:flex;align-items:center;gap:8px}
+.status-dot{width:7px;height:7px;flex-shrink:0;border-radius:50%;background:#72b7ff;box-shadow:0 0 8px rgba(114,183,255,.5)}
+.status-text{color:#aab3ba;font-size:9px;font-weight:700}
+.status-detail{margin-top:5px;padding-left:15px;color:#505b63;font-size:8px}
+.endpoint{margin-top:10px;padding:10px 11px;border-radius:8px;background:#050709;border:1px solid #171d22}
+.endpoint-label{color:#4e5961;font-size:7px;letter-spacing:1px}
+.endpoint-value{margin-top:5px;color:#72b7ff;font-size:8px;line-height:1.5;word-break:break-all}
+.log{margin-top:10px;padding:10px 11px;min-height:125px;max-height:205px;overflow:hidden;border-radius:8px;background:#050709;border:1px solid #171d22;color:#737e86;font-size:8px;line-height:1.7;white-space:pre-wrap;word-break:break-word}
+.log-info{color:#72b7ff}
+.log-ok{color:#5cff8d}
+.log-error{color:#ff6875}
+.log-warning{color:#ffd166}
+.footer{margin-top:10px;padding-top:9px;border-top:1px solid #171d22;text-align:center;color:#3d464d;font-size:7px;letter-spacing:.7px}
+</style>
+</head><body>
+<div class="terminal">
+  <div class="header">
+    <div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
+    <div class="terminal-title">rich@websocket ~ terminal</div>
+  </div>
+  <div class="content">
+    <div class="command-line">
+      <span class="user">rich</span><span class="symbol">@</span><span class="host">websocket</span><span class="symbol">:~$</span><span class="command">ws-connect</span>
+    </div>
+    <div class="title">WebSocket Rich</div>
+    <div class="subtitle">REALTIME CONNECTION / RICH RESPONSE</div>
+    <div class="status">
+      <div class="status-row">
+        <div id="statusDot" class="status-dot"></div>
+        <div id="status" class="status-text">CONNECTING...</div>
+      </div>
+      <div id="detail" class="status-detail">Initializing WebSocket...</div>
+    </div>
+    <div class="endpoint">
+      <div class="endpoint-label">WSS ENDPOINT</div>
+      <div id="endpoint" class="endpoint-value"></div>
+    </div>
+    <div id="log" class="log">[SYS] Initializing...</div>
+    <div class="footer">RICH WEBSOCKET • REALTIME</div>
+  </div>
+</div>
+<script>
+(()=>{
+  const WS_URL='${wsUrl}';
+  const status=document.getElementById('status');
+  const detail=document.getElementById('detail');
+  const endpoint=document.getElementById('endpoint');
+  const log=document.getElementById('log');
+  const statusDot=document.getElementById('statusDot');
+  endpoint.textContent=WS_URL;
+  const getTime()=>new Date().toLocaleTimeString('en-US',{hour12:false});
+  const addLog=(text,type='normal')=>{
+    const line=document.createElement('span');
+    line.className=type==='normal'?'':'log-'+type;
+    line.textContent='['+getTime()+'] '+text;
+    log.appendChild(document.createTextNode('\\n'));
+    log.appendChild(line);
+    log.scrollTop=log.scrollHeight;
+  };
+  const setStatus=(title,desc,type)=>{
+    status.textContent=title;
+    detail.textContent=desc;
+    if(type==='success'){statusDot.style.background='#5cff8d';statusDot.style.boxShadow='0 0 8px rgba(92,255,141,.55)'}
+    else if(type==='error'){statusDot.style.background='#ff6875';statusDot.style.boxShadow='0 0 8px rgba(255,104,117,.55)'}
+    else if(type==='warning'){statusDot.style.background='#ffd166';statusDot.style.boxShadow='0 0 8px rgba(255,209,102,.55)'}
+    else{statusDot.style.background='#72b7ff';statusDot.style.boxShadow='0 0 8px rgba(114,183,255,.55)'}
+  };
+  if(!window.WebSocket){setStatus('NOT SUPPORTED','WebSocket unavailable','error');addLog('[ERR] No WebSocket','error');return}
+  addLog('[INFO] Connecting...','info');
+  addLog('[INFO] Protocol: WSS','info');
+  let ws;
+  try{ws=new WebSocket(WS_URL)}catch(e){setStatus('FAILED',e.message,'error');addLog('[ERR] '+e.message,'error');return}
+  ws.onopen=()=>{
+    setStatus('CONNECTED','WebSocket connected','success');
+    addLog('[OK] Connected','ok');
+    addLog('[OK] Tunnel reachable','ok');
+    ws.send(JSON.stringify({event:'connection_test',sender:'RICH_CLIENT',message:'HELLO',time:Date.now()}));
+    addLog('[SEND] connection_test','info');
+  };
+  ws.onmessage=e=>{
+    addLog('[RECV] '+e.data,'ok');
+    try{
+      const d=JSON.parse(e.data);
+      if(d.event==='connection')addLog('[OK] CONFIRMED','ok');
+      if(d.event==='connection_test'){setStatus('SUCCESS','Realtime received','success');addLog('[OK] REALTIME OK','ok')}
+      if(d.event==='rich:data'){addLog('[DATA] '+JSON.stringify(d.data),'info')}
+    }catch{addLog('[OK] Data received','ok')}
+  };
+  ws.onerror=()=>{setStatus('ERROR','Connection failed','error');addLog('[ERR] WebSocket error','error')};
+  ws.onclose=e=>{setStatus('CLOSED','Disconnected','warning');addLog('[CLOSE] Code: '+e.code,'warning')};
+})()
+</script>
+</body></html>`;
 }
 
-async function handlePairing(phone, res) {
-  if (pairingInProgress) {
-    res.writeHead(409, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Pairing already in progress' }));
-    return;
+// ─── Baileys Plugin Code ─────────────────────────────────────────────────────
+function getPluginCode(host) {
+  const wsUrl = `wss://${host}`;
+  return `// Auto-generated Baileys Plugin
+// WebSocket Rich Response - hosted on ${host}
+
+const WS_URL = '${wsUrl}';
+
+const sources = [
+  {
+    source_type: 'THIRD_PARTY',
+    source_display_name: 'Rich WebSocket',
+    source_subtitle: 'Realtime Connection',
+    source_url: WS_URL,
+    favicon: {
+      url: 'https://cdn-icons-png.flaticon.com/512/2166/2166823.png',
+      mime_type: 'image/png',
+      width: 16,
+      height: 16
+    }
   }
+];
 
-  if (waConnected) {
-    res.writeHead(409, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Already connected', phone: waPhoneNumber }));
-    return;
-  }
+module.exports = {
+  command: ['.rich', '.ws'],
+  tags: ['tools'],
+  help: '.rich - Send WebSocket Rich Response',
+  
+  async run(conn, m, { text }) {
+    const { proto, generateWAMessageFromContent, generateMessageIDV2 } = 
+      await import('@whiskeysockets/baileys');
 
-  pairingInProgress = true;
+    // Fetch HTML from server
+    const res = await fetch(WS_URL + '/rich');
+    const html = await res.text();
 
-  try {
-    // Restart with pairing code
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const { version } = await fetchLatestBaileysVersion();
-
-    waSocket = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
-      logger,
-      printQRInTerminal: false,
-      browser: ['WebSocket-Bot', 'Chrome', '1.0.0'],
-      generateHighQualityLinkPreview: false,
-    });
-
-    // Wait for pairing code
-    const code = await waSocket.requestPairingCode(phone);
-
-    console.log(`[WA:PAIRING] Code for ${phone}: ${code}`);
-    broadcastToWS({ type: 'wa:pairing', phone, code });
-
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ phone, code, message: 'Enter this code on your WhatsApp' }));
-
-    // Handle connection after pairing
-    waSocket.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect } = update;
-      if (connection === 'open') {
-        waConnected = true;
-        waPhoneNumber = waSocket.user?.id?.split(':')[0] || phone;
-        pairingInProgress = false;
-        console.log(`[WA:CONNECTED] Phone: ${waPhoneNumber}`);
-        broadcastToWS({ type: 'wa:status', connected: true, phone: waPhoneNumber });
-      }
-      if (connection === 'close') {
-        waConnected = false;
-        pairingInProgress = false;
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        if (statusCode !== DisconnectReason.loggedOut) {
-          setTimeout(() => startWhatsApp(), 5000);
+    const richResponseMessage = {
+      messageType: 1,
+      submessages: [
+        {
+          messageType: proto.AIRichResponseSubMessageType.AI_RICH_RESPONSE_TEXT,
+          messageText: 'WebSocket Rich Response'
         }
+      ],
+      unifiedResponse: {
+        data: Buffer.from(JSON.stringify({
+          response_id: generateMessageIDV2(),
+          sections: [{
+            view_model: {
+              primitive: {
+                __typename: 'GenAIaeacdsnwHtmlPrimitive',
+                payload: html,
+                trusted_sources: sources.map(x => x.source_url)
+              },
+              __typename: 'GenAISingleLayoutViewModel'
+            }
+          }]
+        })).toString('base64')
+      },
+      contextInfo: {
+        forwardingScore: 1,
+        isForwarded: true,
+        forwardedAiBotMessageInfo: { botJid: '0@bot' },
+        forwardOrigin: 4
       }
+    };
+
+    const isi = {
+      messageContextInfo: {
+        deviceListMetadata: {},
+        deviceListMetadataVersion: 2,
+        botMetadata: {
+          messageDisclaimerText: 'WebSocket Rich',
+          richResponseSourcesMetadata: { sources }
+        }
+      },
+      botForwardedMessage: {
+        message: { richResponseMessage }
+      }
+    };
+
+    const msg = generateWAMessageFromContent(m.chat, isi, {
+      messageId: generateMessageIDV2()
     });
 
-    waSocket.ev.on('creds.update', saveCreds);
-
-    // Re-attach message handler
-    waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        const from = msg.key.remoteJid;
-        const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-        const sender = msg.pushName || from.split('@')[0];
-        broadcastToWS({
-          type: 'wa:message', from, sender, text,
-          timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
-          id: msg.key.id,
-        });
-      }
-    });
-
-  } catch (err) {
-    pairingInProgress = false;
-    console.error('[WA:PAIR_ERROR]', err.message);
-    if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    await conn.relayMessage(m.chat, msg.message, { messageId: msg.key.id });
+    return m.reply('Rich WebSocket terkirim ✅');
   }
-}
-
-async function sendWhatsAppMessage(to, text) {
-  if (!waSocket || !waConnected) throw new Error('WhatsApp not connected');
-  const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-  return waSocket.sendMessage(jid, { text });
+};
+`;
 }
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-  console.log(`✅ WebSocket: ws://0.0.0.0:${PORT}`);
-  console.log(`✅ Health: http://0.0.0.0:${PORT}/health`);
-
-  // Try to start WhatsApp with existing auth
-  try {
-    await startWhatsApp();
-  } catch (err) {
-    console.log('[WA] No existing auth, use /pair?phone=62xxx to connect');
-  }
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(\`✅ Server: http://0.0.0.0:\${PORT}\`);
+  console.log(\`✅ WebSocket: ws://0.0.0.0:\${PORT}\`);
+  console.log(\`✅ Rich Page: http://0.0.0.0:\${PORT}/rich\`);
+  console.log(\`✅ Plugin: http://0.0.0.0:\${PORT}/plugin.js\`);
 });
