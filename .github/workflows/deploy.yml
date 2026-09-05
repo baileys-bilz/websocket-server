@@ -8,12 +8,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy
+      - name: Trigger Railway deploy
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --service=${{ secrets.RAILWAY_SERVICE_ID }}
+        run: |
+          curl -s -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            https://backboard.railway.app/graphql/v2 \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"query":"mutation { deploymentRedeploy(id: \"${{ secrets.RAILWAY_DEPLOY_ID }}\") { id status } }"}'
